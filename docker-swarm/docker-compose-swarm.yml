@@ -1,0 +1,259 @@
+x-common-settings: &common-settings
+  logging:
+    driver: "json-file"
+    options:
+      "max-size": "10m"
+      "max-file": "5"
+
+x-common-deploy: &common-deploy
+  replicas: 1
+  placement:
+    max_replicas_per_node: 1
+  update_config:
+    parallelism: 1
+    order: stop-first
+    failure_action: rollback
+    delay: 60s
+  rollback_config:
+    parallelism: 0
+    order: stop-first
+  restart_policy:
+    condition: any
+    delay: 30s
+    max_attempts: 5
+    window: 210s
+  resources:
+    limits:
+      cpus: '2'
+      memory: 4G
+
+x-common-healthcheck: &common-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 4
+  start_period: 30s
+
+volumes:
+  mysql-swarm:
+
+#######################################################################################
+
+services:
+  mysql-1:
+    <<: *common-settings
+    image: container-registry.oracle.com/mysql/community-server:8.0.37
+    hostname: "mysql1"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -d /var/lib/mysql/performance_schema ]; then
+          echo 'MySQL database not found, first run.'
+          sh -c "
+            while ! mysqladmin ping -uroot -p$$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do
+              sleep 2
+              echo 'Waiting for local MySQL to start...'
+            done
+            sleep 20
+            mysql -uroot -p$$MYSQL_ROOT_PASSWORD -e \"CREATE USER '$$MYSQL_INNODB_USER'@'%' IDENTIFIED BY '$$MYSQL_INNODB_PASSWORD'; GRANT ALL privileges ON *.* TO '$$MYSQL_INNODB_USER'@'%' with grant option; reset master;\"
+            while ! mysqladmin ping -h mysql2 -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD >/dev/null 2>&1 || ! mysqladmin ping -h mysql3 -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD >/dev/null 2>&1; do
+              sleep 3
+              echo 'Waiting for all MySQL to start...'
+            done
+            sleep 30
+            echo 'Creating InnoDB cluster...'
+            mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -e\" \
+              shell.storeCredential('$$MYSQL_INNODB_USER@mysql1:3306', '$$MYSQL_INNODB_PASSWORD'); \
+              shell.storeCredential('$$MYSQL_INNODB_USER@mysql2:3306', '$$MYSQL_INNODB_PASSWORD'); \
+              shell.storeCredential('$$MYSQL_INNODB_USER@mysql3:3306', '$$MYSQL_INNODB_PASSWORD'); \
+              dba.configureInstance('$$MYSQL_INNODB_USER@mysql3:3306',{'restart': false, 'interactive': false}); \
+              dba.configureInstance('$$MYSQL_INNODB_USER@mysql2:3306',{'restart': false, 'interactive': false}); \
+              dba.configureInstance('$$MYSQL_INNODB_USER@mysql1:3306',{'restart': false, 'interactive': false}); \
+              var cluster = dba.createCluster('Cluster'); \
+              cluster.addInstance('$$MYSQL_INNODB_USER@mysql2:3306',{'recoveryMethod': 'incremental'}); \
+              cluster.addInstance('$$MYSQL_INNODB_USER@mysql3:3306',{'recoveryMethod': 'incremental'}); \
+              \"
+            # test user
+            mysql -uroot -p$$MYSQL_ROOT_PASSWORD -e \" \
+              CREATE DATABASE IF NOT EXISTS $$TEST_MYSQL_DATABASE; \
+              CREATE USER '$$TEST_MYSQL_USER'@'%' IDENTIFIED WITH mysql_native_password BY '$$TEST_MYSQL_PASSWORD'; \
+              GRANT ALL PRIVILEGES ON *.* TO '$$TEST_MYSQL_USER'@'%'; \
+              \"
+            sleep 2
+            mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.getCluster().status();\"
+          " &
+        else
+          echo 'MySQL database found, not the first run.'
+          if [ -d /var/lib/mysql/mysql_innodb_cluster_metadata ]; then
+            sh -c "
+              while ! mysqladmin ping -uroot -p$$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do
+                sleep 2
+                echo 'Waiting for local MySQL to start...'
+              done
+              sleep 45
+              # rebootClusterFromCompleteOutage
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -h mysql1 -i -e\"dba.getCluster().status();\" 2>&1 >/dev/null | grep 'metadata exists, instance belongs to that metadata, but GR is not active' && \
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -h mysql2 -i -e\"dba.getCluster().status();\" 2>&1 >/dev/null | grep 'metadata exists, instance belongs to that metadata, but GR is not active' && \
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -h mysql3 -i -e\"dba.getCluster().status();\" 2>&1 >/dev/null | grep 'metadata exists, instance belongs to that metadata, but GR is not active' && \
+              echo 'Recovering...' && \
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.rebootClusterFromCompleteOutage();\"
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.getCluster().status();\"
+            " &
+          fi
+        fi
+        exec /entrypoint.sh mysqld --server_id=1 --binlog_checksum=NONE --gtid_mode=ON --enforce_gtid_consistency=ON --binlog_transaction_dependency_tracking=WRITESET --log_bin=mysql-bin --sql_generate_invisible_primary_key=on  --log_error_verbosity=1 --max-connections=4096
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - mysql-swarm:/var/lib/mysql/
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_INNODB_USER: inno
+      MYSQL_INNODB_PASSWORD: inno
+      TEST_MYSQL_USER: test
+      TEST_MYSQL_PASSWORD: test
+      TEST_MYSQL_DATABASE: test
+    deploy:
+      <<: *common-deploy
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.node == 1
+
+
+  mysql-2:
+    <<: *common-settings
+    image: container-registry.oracle.com/mysql/community-server:8.0.37
+    hostname: "mysql2"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -d /var/lib/mysql/performance_schema ]; then
+          echo 'MySQL database not found, first run.'
+          sh -c "
+            while ! mysqladmin ping -uroot -p$$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do
+              sleep 2
+              echo 'Waiting for local MySQL to start...'
+            done
+            sleep 20
+            mysql -uroot -p$$MYSQL_ROOT_PASSWORD -e \"CREATE USER '$$MYSQL_INNODB_USER'@'%' IDENTIFIED BY '$$MYSQL_INNODB_PASSWORD'; GRANT ALL privileges ON *.* TO '$$MYSQL_INNODB_USER'@'%' with grant option; reset master;\"
+            sleep 90
+            mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.getCluster().status();\"
+          " &
+        else
+          echo 'MySQL database found, not the first run.'
+          if [ -d /var/lib/mysql/mysql_innodb_cluster_metadata ]; then
+            sh -c "
+              sleep 120
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.getCluster().status();\"
+            " &
+          fi
+        fi
+        exec /entrypoint.sh mysqld --server_id=2 --binlog_checksum=NONE --gtid_mode=ON --enforce_gtid_consistency=ON --binlog_transaction_dependency_tracking=WRITESET --log_bin=mysql-bin --sql_generate_invisible_primary_key=on  --log_error_verbosity=1 --max-connections=4096
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - mysql-swarm:/var/lib/mysql/
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_INNODB_USER: inno
+      MYSQL_INNODB_PASSWORD: inno
+    deploy:
+      <<: *common-deploy
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.node == 2
+
+
+  mysql-3:
+    <<: *common-settings
+    image: container-registry.oracle.com/mysql/community-server:8.0.37
+    hostname: "mysql3"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -d /var/lib/mysql/performance_schema ]; then
+          echo 'MySQL database not found, first run.'
+          sh -c "
+            while ! mysqladmin ping -uroot -p$$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do
+              sleep 2
+              echo 'Waiting for local MySQL to start...'
+            done
+            sleep 20
+            mysql -uroot -p$$MYSQL_ROOT_PASSWORD -e \"CREATE USER '$$MYSQL_INNODB_USER'@'%' IDENTIFIED BY '$$MYSQL_INNODB_PASSWORD'; GRANT ALL privileges ON *.* TO '$$MYSQL_INNODB_USER'@'%' with grant option; reset master;\"
+            sleep 90
+            mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.getCluster().status();\"
+          " &
+        else
+          echo 'MySQL database found, not the first run.'
+          if [ -d /var/lib/mysql/mysql_innodb_cluster_metadata ]; then
+            sh -c "
+              sleep 120
+              mysqlsh -u$$MYSQL_INNODB_USER -p$$MYSQL_INNODB_PASSWORD -S/var/run/mysqld/mysqlx.sock -i -e\"dba.getCluster().status();\"
+            " &
+          fi
+        fi
+        exec /entrypoint.sh mysqld --server_id=3 --binlog_checksum=NONE --gtid_mode=ON --enforce_gtid_consistency=ON --binlog_transaction_dependency_tracking=WRITESET --log_bin=mysql-bin --sql_generate_invisible_primary_key=on  --log_error_verbosity=1 --max-connections=4096
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - mysql-swarm:/var/lib/mysql/
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_INNODB_USER: inno
+      MYSQL_INNODB_PASSWORD: inno
+    deploy:
+      <<: *common-deploy
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.node == 3
+
+#######################################################################################
+
+  mysql-router:
+    <<: *common-settings
+    image: container-registry.oracle.com/mysql/community-router:8.0.37
+    hostname: "mysql-router{{.Task.Slot}}"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while ! mysqladmin ping -h mysql1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD >/dev/null 2>&1; do
+          sleep 5
+          echo 'Waiting for mysql1 to start...'
+        done
+        echo "Waiting 60s..."
+        sleep 60
+        exec /run.sh mysqlrouter
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    # ports:
+    #   - "6446:6446" # rw
+    #   - "6447:6447" # ro
+    #   - "8443:8443" # HTTPS REST interface port
+    environment:
+      MYSQL_HOST: mysql1
+      MYSQL_PORT: 3306
+      MYSQL_USER: inno
+      MYSQL_PASSWORD: inno
+      MYSQL_INNODB_CLUSTER_MEMBERS: 2
+      MYSQL_ROUTER_BOOTSTRAP_EXTRA_OPTIONS: --conf-set-option=DEFAULT.max_connections=4096 --conf-set-option=DEFAULT.max_total_connections=4096
+    healthcheck:
+      <<: *common-healthcheck
+      test: mysqladmin ping -h127.0.0.1 -P 6446 -u$$MYSQL_USER -p$$MYSQL_PASSWORD
+    deploy:
+      <<: *common-deploy
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+        constraints:
+          - node.role == manager
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        delay: 60s
+      rollback_config:
+        parallelism: 0
+        order: start-first
